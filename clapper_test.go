@@ -2,11 +2,62 @@ package clapper
 
 import (
 	"fmt"
-	"os"
-	"os/exec"
 	"strings"
 	"testing"
 )
+
+// This entire suite would be far easier with testify
+
+var tests []struct {
+	subCommand string
+	arg        string
+	longName   string
+	shortName  string
+	isBool     bool
+	defaultVal string
+}
+
+func setup(t *testing.T, args []string) (*CommandConfig, error) {
+	tests = []struct {
+		subCommand string
+		arg        string
+		longName   string
+		shortName  string
+		isBool     bool
+		defaultVal string
+	}{
+		{"", "output", "", "", false, ""},
+		{"", "", "force", "f", true, ""},
+		{"", "", "verbose", "v", true, ""},
+		{"", "", "version", "V", false, ""},
+		{"", "", "dir", "", false, "/var/users"},
+		{"info", "category", "", "", false, "manager"},
+		{"info", "username", "", "", false, ""},
+		{"info", "subjects...", "", "", false, ""},
+		{"info", "", "verbose", "v", true, ""},
+		{"info", "", "version", "V", false, "1.0.1"},
+		{"info", "", "output", "o", false, "./"},
+		{"info", "", "no-clean", "", true, ""},
+		{"ghost", "", "", "", false, ""},
+	}
+
+	reg := NewRegistry()
+	subs := make(map[string]*CommandConfig)
+	for _, test := range tests {
+		sub := subs[test.subCommand]
+		if sub == nil {
+			sub, _ = reg.Register(test.subCommand)
+			subs[test.subCommand] = sub
+		}
+		if test.longName != "" {
+			sub.AddFlag(test.longName, test.shortName, test.isBool, test.defaultVal)
+		} else if test.arg != "" {
+			sub.AddArg(test.arg, test.defaultVal)
+		}
+	}
+
+	return reg.Parse(args)
+}
 
 /*----------------*/
 
@@ -14,15 +65,16 @@ import (
 func TestUnsupportedAssignment(t *testing.T) {
 
 	tests := []struct {
-		flag    string
-		options string
-		err     error
+		flag     string
+		expected string
+		options  string
+		err      error
 	}{
-		{"---version", "---version", ErrorUnsupportedFlag{}},
-		{"---v", "---v=1.0.0", ErrorUnsupportedFlag{}},
+		{"---version", "---version", "---version", ErrorUnsupportedFlag{}},
+		{"---v", "---v", "---v=1.0.0", ErrorUnsupportedFlag{}},
 		// Single-dash for long names was never supported, but now this is interpreted as:
 		// -v -e -r -s -i -o -n; ergo, the error will be "unknown option '-e'"
-		{"-e", "-version", ErrorUnknownFlag{}},
+		{"-e", "-version", "-version", ErrorUnsupportedFlag{}},
 	}
 
 	for _, test := range tests {
@@ -31,70 +83,65 @@ func TestUnsupportedAssignment(t *testing.T) {
 		root.AddFlag("version", "v", true, "")
 
 		_, err := reg.Parse([]string{test.options})
-		if err == nil {
-			t.Errorf("(%s) expected parse error %T", test.options, test.err)
-		} else {
-			if fmt.Sprintf("%T", err) != fmt.Sprintf("%T", test.err) {
-				t.Errorf("(%s) expected %T error -- got %T", test.options, test.err, err)
+		assertError(t, err, "(%s) %T", test.options, test.err)
+		if err != nil {
+			assertEqual(t, fmt.Sprintf("%T", err), fmt.Sprintf("%T", test.err))
+			var name string
+			switch e := err.(type) {
+			case ErrorUnknownFlag:
+				name = e.Name
+			case ErrorUnsupportedFlag:
+				name = e.Name
+			default:
+				assertError(t, err)
 			}
-			if !strings.Contains(err.Error(), test.flag) {
-				t.Errorf("(%s) expected error %q -- got %q", test.options, test.flag, err)
-			}
+			assertEqual(t, test.expected, name)
 		}
 	}
 }
 
 // test empty root command
 func TestEmptyRootCommand(t *testing.T) {
-	// command
-	cmd := exec.Command("go", "run", "demo/cmd.go")
+	cmd, err := setup(t, []string{})
 
-	// get output
-	if output, err := cmd.Output(); err != nil {
-		fmt.Println("Error:", err)
-	} else {
-		lines := []string{
-			`sub-command => ""`,
-			`argument(output) => &clapper.Arg{Name:"output", IsVariadic:false, DefaultValue:"", Value:""}`,
-			`flag(force) => &clapper.Flag{Name:"force", ShortName:"f", IsBoolean:true, IsInverted:false, DefaultValue:"false", Value:""}`,
-			`flag(verbose) => &clapper.Flag{Name:"verbose", ShortName:"v", IsBoolean:true, IsInverted:false, DefaultValue:"false", Value:""}`,
-			`flag(version) => &clapper.Flag{Name:"version", ShortName:"V", IsBoolean:false, IsInverted:false, DefaultValue:"", Value:""}`,
-			`flag(dir) => &clapper.Flag{Name:"dir", ShortName:"", IsBoolean:false, IsInverted:false, DefaultValue:"/var/users", Value:""}`,
+	assertNoError(t, err)
+	assertEqual(t, "", cmd.Name)
+	assertEqual(t, 1, len(cmd.Args))
+
+	if cmd.Args["output"] == nil {
+		for k := range cmd.Args {
+			t.Errorf("expected one \"output\" argument; got %s", k)
 		}
+	}
 
-		for _, line := range lines {
-			if !strings.Contains(fmt.Sprintf("%s", output), line) {
-				t.Fail()
+}
+
+func TestRootDefaults(t *testing.T) {
+	cmd, err := setup(t, []string{})
+
+	assertNoError(t, err)
+	assertEqual(t, "", cmd.Args["output"].Value)
+
+	for _, test := range tests {
+		if test.longName != "" && test.subCommand == "" {
+			f := cmd.Flags[test.longName]
+			assertNotNil(t, f, "missing flag %q", test.longName)
+			assertEqual(t, test.shortName, f.ShortName, "(%s)", test.longName)
+			assertEqual(t, test.isBool, f.IsBoolean, "(%s)", test.longName)
+			dv := test.defaultVal
+			if test.isBool && dv == "" {
+				dv = "false"
 			}
+			assertEqual(t, dv, f.DefaultValue, "(%+v %+v)", test, f)
 		}
 	}
 }
 
 // test root command when not registered
-func TestUnregisteredRootCommand(t *testing.T) {
-	// command
-	cmd := exec.Command("go", "run", "demo/cmd.go")
-	cmd.Env = append(os.Environ(), "NO_ROOT=TRUE")
-
-	// get output
-	if output, err := cmd.Output(); err != nil {
-		fmt.Println("Error:", err)
-	} else {
-		lines := []string{
-			`error => clapper.ErrorUnknownCommand{Name:""}`,
-		}
-
-		for _, line := range lines {
-			if !strings.Contains(fmt.Sprintf("%s", output), line) {
-				t.Fail()
-			}
-		}
-	}
-}
+// REMOVED This was testing code in the demo program, which had nothing to do with the library.
 
 // test an unregistered flag
 func TestUnregisteredFlag(t *testing.T) {
-
 	// flags
 	flags := map[string][]string{
 		"-d":          {"-V", "1.0.1", "-v", "--force", "-d", "./sub/dir"},
@@ -103,54 +150,44 @@ func TestUnregisteredFlag(t *testing.T) {
 	}
 
 	for flag, options := range flags {
-		// command
-		cmd := exec.Command("go", append([]string{"run", "demo/cmd.go"}, options...)...)
-
-		// get output
-		if output, err := cmd.Output(); err != nil {
-			fmt.Println("Error:", err)
+		_, err := setup(t, options)
+		assertError(t, err)
+		if e, ok := err.(ErrorUnknownFlag); !ok {
+			t.Errorf("expected an ErrUnknownFlag; got %t", err)
 		} else {
-			if !strings.Contains(fmt.Sprintf("%s", output), fmt.Sprintf(`error => clapper.ErrorUnknownFlag{Name:"%s"}`, flag)) {
-				t.Fail()
-			}
+			assertEqual(t, flag, e.Name)
 		}
 	}
-
 }
 
 // test for valid inverted flag values
 func TestValidInvertFlagValues(t *testing.T) {
-
 	// options list
 	optionsList := [][]string{
 		{"info", "student", "-V", "-v", "--output", "./opt/dir", "--no-clean"},
 		{"info", "student", "--version", "--no-clean", "--output", "./opt/dir", "--verbose"},
 	}
+	expecteds := map[string]string{
+		"version": "",
+		"clean":   "false",
+		"output":  "./opt/dir",
+		"verbose": "true",
+	}
 
 	for _, options := range optionsList {
-		// command
-		cmd := exec.Command("go", append([]string{"run", "demo/cmd.go"}, options...)...)
-
-		// get output
-		if output, err := cmd.Output(); err != nil {
-			fmt.Println("Error:", err)
-		} else {
-			lines := []string{
-				`sub-command => "info"`,
-				`argument(category) => &clapper.Arg{Name:"category", IsVariadic:false, DefaultValue:"manager", Value:"student"}`,
-				`argument(username) => &clapper.Arg{Name:"username", IsVariadic:false, DefaultValue:"", Value:""}`,
-				`argument(subjects) => &clapper.Arg{Name:"subjects", IsVariadic:true, DefaultValue:"", Value:""}`,
-				`flag(version) => &clapper.Flag{Name:"version", ShortName:"V", IsBoolean:false, IsInverted:false, DefaultValue:"1.0.1", Value:""}`,
-				`flag(output) => &clapper.Flag{Name:"output", ShortName:"o", IsBoolean:false, IsInverted:false, DefaultValue:"./", Value:"./opt/dir"}`,
-				`flag(verbose) => &clapper.Flag{Name:"verbose", ShortName:"v", IsBoolean:true, IsInverted:false, DefaultValue:"false", Value:"true"}`,
-				`flag(clean) => &clapper.Flag{Name:"clean", ShortName:"", IsBoolean:true, IsInverted:true, DefaultValue:"true", Value:"false"}`,
+		cmd, err := setup(t, options)
+		assertNoError(t, err)
+		assertEqual(t, options[0], cmd.Name)
+		assertEqual(t, options[1], cmd.Args["category"].Value)
+		assertEqual(t, "", cmd.Args["username"].Value)
+		assertEqual(t, "", cmd.Args["subjects"].Value)
+		for _, opt := range options {
+			if strings.HasPrefix("--no", opt) && cmd.Flags[opt].IsInverted != true {
+				t.Errorf("expected inverted flag for %s", opt)
 			}
-
-			for _, line := range lines {
-				if !strings.Contains(fmt.Sprintf("%s", output), line) {
-					t.Fail()
-				}
-			}
+		}
+		for k, v := range expecteds {
+			assertEqual(t, v, cmd.Flags[k].Value)
 		}
 	}
 }
@@ -165,23 +202,18 @@ func TestErrorUnknownFlagForInvertFlags(t *testing.T) {
 	}
 
 	for flag, options := range optionsList {
-		// command
-		cmd := exec.Command("go", append([]string{"run", "demo/cmd.go"}, options...)...)
-
-		// get output
-		if output, err := cmd.Output(); err != nil {
-			fmt.Println("Error:", err)
+		_, err := setup(t, options)
+		assertError(t, err)
+		if e, ok := err.(ErrorUnknownFlag); !ok {
+			t.Errorf("expected an ErrUnknownFlag; got %t", err)
 		} else {
-			if !strings.Contains(fmt.Sprintf("%s", output), fmt.Sprintf(`error => clapper.ErrorUnknownFlag{Name:"%s"}`, flag)) {
-				t.Fail()
-			}
+			assertEqual(t, flag, e.Name)
 		}
 	}
 }
 
 // test `--flag=value` syntax
 func TestFlagAssignmentSyntax(t *testing.T) {
-
 	// options list
 	optionsList := [][]string{
 		{"info", "student", "-v", "--version=2.0.0", "thatisuday"},
@@ -189,29 +221,15 @@ func TestFlagAssignmentSyntax(t *testing.T) {
 	}
 
 	for _, options := range optionsList {
-		// command
-		cmd := exec.Command("go", append([]string{"run", "demo/cmd.go"}, options...)...)
-
-		// get output
-		if output, err := cmd.Output(); err != nil {
-			fmt.Println("Error:", err)
-		} else {
-			lines := []string{
-				`sub-command => "info"`,
-				`argument(category) => &clapper.Arg{Name:"category", IsVariadic:false, DefaultValue:"manager", Value:"student"}`,
-				`argument(username) => &clapper.Arg{Name:"username", IsVariadic:false, DefaultValue:"", Value:"thatisuday"}`,
-				`argument(subjects) => &clapper.Arg{Name:"subjects", IsVariadic:true, DefaultValue:"", Value:""}`,
-				`flag(version) => &clapper.Flag{Name:"version", ShortName:"V", IsBoolean:false, IsInverted:false, DefaultValue:"1.0.1", Value:"2.0.0"}`,
-				`flag(output) => &clapper.Flag{Name:"output", ShortName:"o", IsBoolean:false, IsInverted:false, DefaultValue:"./", Value:""}`,
-				`flag(verbose) => &clapper.Flag{Name:"verbose", ShortName:"v", IsBoolean:true, IsInverted:false, DefaultValue:"false", Value:"true"}`,
-			}
-
-			for _, line := range lines {
-				if !strings.Contains(fmt.Sprintf("%s", output), line) {
-					t.Errorf("expected\n  %s\ngot\n  %s", line, output)
-				}
-			}
-		}
+		cmd, err := setup(t, options)
+		assertNoError(t, err)
+		assertEqual(t, options[0], cmd.Name)
+		assertEqual(t, options[1], cmd.Args["category"].Value)
+		assertEqual(t, "thatisuday", cmd.Args["username"].Value)
+		assertEqual(t, "", cmd.Args["subjects"].Value)
+		assertEqual(t, "2.0.0", cmd.Flags["version"].Value)
+		assertEqual(t, "", cmd.Flags["output"].Value)
+		assertEqual(t, "true", cmd.Flags["verbose"].Value)
 	}
 }
 
@@ -225,30 +243,17 @@ func TestValidVariadicArgumentValues(t *testing.T) {
 	}
 
 	for _, options := range optionsList {
-		// command
-		cmd := exec.Command("go", append([]string{"run", "demo/cmd.go"}, options...)...)
-
-		// get output
-		if output, err := cmd.Output(); err != nil {
-			fmt.Println("Error:", err)
-		} else {
-			lines := []string{
-				`sub-command => "info"`,
-				`argument(category) => &clapper.Arg{Name:"category", IsVariadic:false, DefaultValue:"manager", Value:"student"}`,
-				`argument(username) => &clapper.Arg{Name:"username", IsVariadic:false, DefaultValue:"", Value:"thatisuday"}`,
-				`argument(subjects) => &clapper.Arg{Name:"subjects", IsVariadic:true, DefaultValue:"", Value:"math,science,physics"}`,
-				`flag(version) => &clapper.Flag{Name:"version", ShortName:"V", IsBoolean:false, IsInverted:false, DefaultValue:"1.0.1", Value:""}`,
-				`flag(output) => &clapper.Flag{Name:"output", ShortName:"o", IsBoolean:false, IsInverted:false, DefaultValue:"./", Value:"./opt/dir"}`,
-				`flag(verbose) => &clapper.Flag{Name:"verbose", ShortName:"v", IsBoolean:true, IsInverted:false, DefaultValue:"false", Value:"true"}`,
-				`flag(clean) => &clapper.Flag{Name:"clean", ShortName:"", IsBoolean:true, IsInverted:true, DefaultValue:"true", Value:"false"}`,
-			}
-
-			for _, line := range lines {
-				if !strings.Contains(fmt.Sprintf("%s", output), line) {
-					t.Fail()
-				}
-			}
-		}
+		cmd, err := setup(t, options)
+		assertNoError(t, err)
+		assertEqual(t, options[0], cmd.Name)
+		assertEqual(t, options[1], cmd.Args["category"].Value)
+		assertEqual(t, "thatisuday", cmd.Args["username"].Value)
+		assertEqual(t, "math,science,physics", cmd.Args["subjects"].Value)
+		assertEqual(t, "", cmd.Flags["version"].Value)
+		assertEqual(t, "./opt/dir", cmd.Flags["output"].Value)
+		assertEqual(t, "true", cmd.Flags["verbose"].Value)
+		assertEqual(t, "false", cmd.Flags["clean"].Value)
+		assertEqual(t, true, cmd.Flags["clean"].IsInverted)
 	}
 }
 
@@ -266,34 +271,20 @@ func TestRootCommandWithOptions(t *testing.T) {
 	}
 
 	for _, options := range optionsList {
-		// command
-		cmd := exec.Command("go", append([]string{"run", "demo/cmd.go"}, options...)...)
-
-		// get output
-		if output, err := cmd.Output(); err != nil {
-			fmt.Println("Error:", err)
-		} else {
-			lines := []string{
-				`sub-command => ""`,
-				`argument(output) => &clapper.Arg{Name:"output", IsVariadic:false, DefaultValue:"", Value:"userinfo"}`,
-				`flag(force) => &clapper.Flag{Name:"force", ShortName:"f", IsBoolean:true, IsInverted:false, DefaultValue:"false", Value:"true"}`,
-				`flag(verbose) => &clapper.Flag{Name:"verbose", ShortName:"v", IsBoolean:true, IsInverted:false, DefaultValue:"false", Value:"true"}`,
-				`flag(version) => &clapper.Flag{Name:"version", ShortName:"V", IsBoolean:false, IsInverted:false, DefaultValue:"", Value:"1.0.1"}`,
-				`flag(dir) => &clapper.Flag{Name:"dir", ShortName:"", IsBoolean:false, IsInverted:false, DefaultValue:"/var/users", Value:"./sub/dir"}`,
-			}
-
-			for _, line := range lines {
-				if !strings.Contains(fmt.Sprintf("%s", output), line) {
-					t.Fail()
-				}
-			}
-		}
+		cmd, err := setup(t, options)
+		assertNoError(t, err)
+		assertEqual(t, "", cmd.Name)
+		assertEqual(t, "userinfo", cmd.Args["output"].Value)
+		assertEqual(t, "true", cmd.Flags["force"].Value)
+		assertEqual(t, false, cmd.Flags["force"].IsInverted)
+		assertEqual(t, "true", cmd.Flags["verbose"].Value)
+		assertEqual(t, "1.0.1", cmd.Flags["version"].Value)
+		assertEqual(t, "./sub/dir", cmd.Flags["dir"].Value)
 	}
 }
 
 // test sub-command with options
 func TestSubCommandWithOptions(t *testing.T) {
-
 	// options list
 	optionsList := [][]string{
 		{"info", "student", "-V", "-v", "--output", "./opt/dir"},
@@ -301,36 +292,21 @@ func TestSubCommandWithOptions(t *testing.T) {
 	}
 
 	for _, options := range optionsList {
-		// command
-		cmd := exec.Command("go", append([]string{"run", "demo/cmd.go"}, options...)...)
-
-		// get output
-		if output, err := cmd.Output(); err != nil {
-			fmt.Println("Error:", err)
-		} else {
-			lines := []string{
-				`sub-command => "info"`,
-				`argument(category) => &clapper.Arg{Name:"category", IsVariadic:false, DefaultValue:"manager", Value:"student"}`,
-				`argument(username) => &clapper.Arg{Name:"username", IsVariadic:false, DefaultValue:"", Value:""}`,
-				`argument(subjects) => &clapper.Arg{Name:"subjects", IsVariadic:true, DefaultValue:"", Value:""}`,
-				`flag(version) => &clapper.Flag{Name:"version", ShortName:"V", IsBoolean:false, IsInverted:false, DefaultValue:"1.0.1", Value:""}`,
-				`flag(output) => &clapper.Flag{Name:"output", ShortName:"o", IsBoolean:false, IsInverted:false, DefaultValue:"./", Value:"./opt/dir"}`,
-				`flag(verbose) => &clapper.Flag{Name:"verbose", ShortName:"v", IsBoolean:true, IsInverted:false, DefaultValue:"false", Value:"true"}`,
-				`flag(clean) => &clapper.Flag{Name:"clean", ShortName:"", IsBoolean:true, IsInverted:true, DefaultValue:"true", Value:""}`,
-			}
-
-			for _, line := range lines {
-				if !strings.Contains(fmt.Sprintf("%s", output), line) {
-					t.Fail()
-				}
-			}
-		}
+		cmd, err := setup(t, options)
+		assertNoError(t, err)
+		assertEqual(t, "info", cmd.Name)
+		assertEqual(t, "student", cmd.Args["category"].Value)
+		assertEqual(t, "", cmd.Args["username"].Value)
+		assertEqual(t, "", cmd.Args["subjects"].Value)
+		assertEqual(t, "", cmd.Flags["version"].Value)
+		assertEqual(t, "./opt/dir", cmd.Flags["output"].Value)
+		assertEqual(t, "true", cmd.Flags["verbose"].Value)
+		assertEqual(t, "", cmd.Flags["clean"].Value)
 	}
 }
 
 // test sub-command with valid and extra arguments
 func TestSubCommandWithArguments(t *testing.T) {
-
 	// options list
 	optionsList := [][]string{
 		{"info", "-v", "student", "-V", "2.0.0", "thatisuday"},
@@ -338,29 +314,15 @@ func TestSubCommandWithArguments(t *testing.T) {
 	}
 
 	for _, options := range optionsList {
-		// command
-		cmd := exec.Command("go", append([]string{"run", "demo/cmd.go"}, options...)...)
-
-		// get output
-		if output, err := cmd.Output(); err != nil {
-			fmt.Println("Error:", err)
-		} else {
-			lines := []string{
-				`sub-command => "info"`,
-				`argument(category) => &clapper.Arg{Name:"category", IsVariadic:false, DefaultValue:"manager", Value:"student"}`,
-				`argument(username) => &clapper.Arg{Name:"username", IsVariadic:false, DefaultValue:"", Value:"thatisuday"}`,
-				`argument(subjects) => &clapper.Arg{Name:"subjects", IsVariadic:true, DefaultValue:"", Value:""}`,
-				`flag(version) => &clapper.Flag{Name:"version", ShortName:"V", IsBoolean:false, IsInverted:false, DefaultValue:"1.0.1", Value:"2.0.0"}`,
-				`flag(output) => &clapper.Flag{Name:"output", ShortName:"o", IsBoolean:false, IsInverted:false, DefaultValue:"./", Value:""}`,
-				`flag(verbose) => &clapper.Flag{Name:"verbose", ShortName:"v", IsBoolean:true, IsInverted:false, DefaultValue:"false", Value:"true"}`,
-			}
-
-			for _, line := range lines {
-				if !strings.Contains(fmt.Sprintf("%s", output), line) {
-					t.Fail()
-				}
-			}
-		}
+		cmd, err := setup(t, options)
+		assertNoError(t, err)
+		assertEqual(t, "info", cmd.Name)
+		assertEqual(t, "student", cmd.Args["category"].Value)
+		assertEqual(t, "thatisuday", cmd.Args["username"].Value)
+		assertEqual(t, "", cmd.Args["subjects"].Value)
+		assertEqual(t, "2.0.0", cmd.Flags["version"].Value)
+		assertEqual(t, "", cmd.Flags["output"].Value)
+		assertEqual(t, "true", cmd.Flags["verbose"].Value)
 	}
 }
 
