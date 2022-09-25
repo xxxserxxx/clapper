@@ -74,7 +74,7 @@ func TestUnsupportedAssignment(t *testing.T) {
 		{"---v", "---v", "---v=1.0.0", ErrorUnsupportedFlag{}},
 		// Single-dash for long names was never supported, but now this is interpreted as:
 		// -v -e -r -s -i -o -n; ergo, the error will be "unknown option '-e'"
-		{"-e", "-version", "-version", ErrorUnsupportedFlag{}},
+		{"-e", "-e", "-version", ErrorUnknownFlag{}},
 	}
 
 	for _, test := range tests {
@@ -85,7 +85,7 @@ func TestUnsupportedAssignment(t *testing.T) {
 		_, err := reg.Parse([]string{test.options})
 		assertError(t, err, "(%s) %T", test.options, test.err)
 		if err != nil {
-			assertEqual(t, fmt.Sprintf("%T", err), fmt.Sprintf("%T", test.err))
+			assertEqual(t, fmt.Sprintf("%T", test.err), fmt.Sprintf("%T", err), "%s", test.flag)
 			var name string
 			switch e := err.(type) {
 			case ErrorUnknownFlag:
