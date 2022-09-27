@@ -9,7 +9,7 @@ import (
 
 func fail(t *testing.T) {
 	_, f, l, _ := runtime.Caller(2)
-	fmt.Printf("%s # %d\n", f, l)
+	fmt.Printf("%s:%d\n", f, l)
 	t.FailNow()
 }
 
@@ -36,13 +36,13 @@ func assertError(t *testing.T, v error, msg ...interface{}) {
 
 func assertNoError(t *testing.T, v error, msg ...interface{}) {
 	if v != nil {
-		t.Errorf("expected no error%s", toErrorS(msg))
+		t.Errorf("expected no error, got: %v%s", v, toErrorS(msg))
 		fail(t)
 	}
 }
 
 func assertEqual(t *testing.T, a interface{}, b interface{}, msg ...interface{}) {
-	if a != b {
+	if !reflect.DeepEqual(a, b) {
 		t.Errorf("expected %v, got %v%s", a, b, toErrorS(msg))
 		fail(t)
 	}
