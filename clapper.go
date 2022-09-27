@@ -25,10 +25,605 @@
 // command-line arguments and command-line flags.
 package clapper
 
+// TODO descriptions for help
+
 import (
 	"fmt"
+	"reflect"
+	"strconv"
 	"strings"
+	"time"
 )
+
+/***********************************************/
+
+// UnknownCommand represents an error when command-line arguments contain an unregistered command.
+type UnknownCommand struct {
+	Name string
+}
+
+func (e UnknownCommand) Error() string {
+	return fmt.Sprintf("unknown command %s found in the arguments", e.Name)
+}
+
+type BadArgument struct {
+	Arg     *Arg
+	Message string
+}
+
+func (e BadArgument) Error() string {
+	return fmt.Sprintf("%s %s", e.Arg.Name, e.Message)
+}
+
+// UnknownFlag represents an error when command-line arguments contain an unregistered flag.
+type UnknownFlag struct {
+	Name string
+}
+
+func (e UnknownFlag) Error() string {
+	return fmt.Sprintf("unknown flag %s found in the arguments", e.Name)
+}
+
+/*---------------------*/
+
+// Registry holds the configuration of the registered commands.
+type Registry map[string]*CommandConfig
+
+// NewRegistry returns new instance of the "Registry"
+func NewRegistry() Registry {
+	return make(Registry)
+}
+
+// Register method registers a command.
+// The "name" argument should be a simple string.
+// If "name" is an empty string, it is considered as a root command.
+// If a command is already registered, the registered `*CommandConfig` object is returned.
+// If the command is already registered, second return value will be `true`.
+func (registry Registry) Register(name string) (*CommandConfig, bool) {
+
+	// remove all whitespaces
+	commandName := removeWhitespaces(name)
+
+	// check if command is already registered, if found, return existing entry
+	if _commandConfig, ok := registry[commandName]; ok {
+		return _commandConfig, true
+	}
+
+	// construct new `CommandConfig` object
+	commandConfig := &CommandConfig{
+		Name:       commandName,
+		Flags:      make(map[string]*Flag),
+		flagsShort: make(map[string]string),
+		Args:       make(map[string]*Arg),
+		ArgNames:   make([]string, 0),
+	}
+
+	// add entry to the registry
+	registry[commandName] = commandConfig
+
+	return commandConfig, false
+}
+
+// Parse method parses command-line arguments and returns an appropriate "*CommandConfig" object registered in the registry.
+// If command is not registered, it return `ErrorUnknownCommand` error.
+// If there is an error parsing a flag, it can return an `ErrorUnknownFlag` or `ErrorUnsupportedFlag` error.
+func (registry Registry) Parse(values []string) (*CommandConfig, error) {
+
+	// command name
+	var commandName string
+
+	// command-line argument values to process
+	valuesToProcess := values
+
+	// check if command is a root command
+	if isRootCommand(values, registry) {
+		commandName = "" // root command name
+	} else {
+		commandName, valuesToProcess = nextValue(values)
+	}
+
+	// format command-line argument values
+	valuesToProcess = formatCommandValues(valuesToProcess)
+
+	// check for invalid flag structure
+	for _, val := range valuesToProcess {
+		if isFlag(val) && isUnknownFlag(val) {
+			return nil, UnknownFlag{val}
+		}
+	}
+
+	// if command is not registered, return `ErrorUnknownCommand` error
+	if _, ok := registry[commandName]; !ok {
+		return nil, UnknownCommand{commandName}
+	}
+
+	// get `CommandConfig` object from the registry
+	commandConfig := registry[commandName]
+
+	// process all command-line arguments (except command name)
+	for {
+
+		// get current command-line argument value
+		var value string
+		value, valuesToProcess = nextValue(valuesToProcess)
+
+		// if `value` is empty, break the loop
+		if len(value) == 0 {
+			break
+		}
+
+		// if the thing is a flag, process as a flag; otherwise, process as an arg
+		if isFlag(value) {
+
+			// trim `-` characters from the `value`
+			name := strings.TrimLeft(value, "-")
+
+			// get flag object stored in the `commandConfig`
+			var flag *Flag
+			var isBool bool
+
+			// check if flag is short or long
+			if isShortFlag(value) {
+				if _, ok := commandConfig.flagsShort[name]; !ok {
+					return nil, UnknownFlag{value}
+				}
+
+				// get long flag name
+				flagName := commandConfig.flagsShort[name]
+
+				flag = commandConfig.Flags[flagName]
+
+				_, isBool = flag.defaultValue.(bool)
+
+				// there is no argument; just set the value
+				if isBool {
+					flag.value = true
+				}
+
+			} else {
+
+				// If it's a long flag, the check for bool (which has no value)
+				var isInv bool
+				if strings.HasPrefix(name, "no-") {
+					name = name[3:]
+					isInv = true
+				}
+				flag = commandConfig.Flags[name]
+				if flag == nil {
+					return nil, UnknownFlag{value}
+				}
+				_, isBool = flag.defaultValue.(bool)
+				if isBool {
+					flag.value = !isInv
+				}
+				if isInv {
+					if !isBool {
+						return nil, BadArgument{&flag.Arg, "non-bool flag"}
+					}
+				}
+			}
+			var err error
+			if !isBool {
+				if nextValue, nextValuesToProcess := nextValue(valuesToProcess); len(nextValue) != 0 && !isFlag(nextValue) {
+					if flag.value, err = convert(nextValue, flag.defaultValue); err != nil {
+						return nil, err
+					}
+					valuesToProcess = nextValuesToProcess
+				} else if len(nextValue) == 0 {
+					return nil, BadArgument{&flag.Arg, "parameter requires an argument, none was provided"}
+				}
+			}
+			if err := validateParams(&flag.Arg); err != nil {
+				return nil, err
+			}
+		} else {
+
+			// process as argument
+			var arg *Arg
+			//var err error
+			for index, argName := range commandConfig.ArgNames {
+				// get argument object stored in the `commandConfig`
+				arg = commandConfig.Args[argName]
+
+				var conval interface{}
+				var err error
+				if conval, err = convert(value, arg.defaultValue); err != nil {
+					return nil, err
+				}
+				var slice reflect.Value
+				if arg.value == nil {
+					if arg.isVariadic {
+						slice = reflect.MakeSlice(reflect.SliceOf(reflect.TypeOf(conval)), 0, 0)
+						rval := reflect.New(slice.Type())
+						rval.Elem().Set(slice)
+						sp := reflect.ValueOf(rval.Interface())
+						svp := sp.Elem()
+						arg.value = svp.Interface()
+					} else {
+						arg.value = conval
+						break
+					}
+				}
+
+				// if last argument is a variadic argument, append values
+				if (index == len(commandConfig.ArgNames)-1) && arg.isVariadic {
+					slice = reflect.ValueOf(arg.value)
+					rval := reflect.New(slice.Type())
+					rval.Elem().Set(slice)
+					sp := reflect.ValueOf(rval.Interface())
+					svp := sp.Elem()
+					svp.Set(reflect.Append(svp, reflect.ValueOf(conval)))
+					arg.value = svp.Interface()
+				}
+			}
+			if err := validateParams(arg); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return commandConfig, nil
+}
+
+func convert(i string, defaults interface{}) (interface{}, error) {
+	var rv interface{}
+	var err error
+	// The default could be an array of allowed values, and if so,
+	// get one of the elements so we can test the type
+	p := reflect.TypeOf(defaults)
+	if p.Kind() == reflect.Slice {
+		p = p.Elem()
+	}
+	timeKind := reflect.TypeOf(time.Now()).Kind()
+	durationKind := reflect.TypeOf(time.Second).Kind()
+	switch p.Kind() {
+	case reflect.Bool:
+		rv, err = strconv.ParseBool(i)
+	case reflect.String:
+		return i, nil
+	case reflect.Int:
+		rv, err = strconv.Atoi(i)
+	case timeKind:
+		rv, err = time.Parse("2006-01-02 03:04", i)
+	case durationKind:
+		rv, err = time.ParseDuration(i)
+	case reflect.Float64:
+		rv, err = strconv.ParseFloat(i, 64)
+	default:
+	}
+	return rv, err
+}
+
+// validate the a.value(s) against the a.defaultValue(s)
+// If a.value is a value, it must match the type of a.defaultValue; or,
+// if a.defaultValue is an array, a.value must be in a.defaultValue.
+//
+// If a.value is an array, every element must be of type a.defaultValue; or,
+// if a.defaultValue is an array, every element in a.value mut be found in a.defaultValue.
+func validateParams(a *Arg) error {
+	if a.value == nil {
+		return BadArgument{a, "parameter requires argument"}
+	}
+	p := reflect.TypeOf(a.value)
+	pv := reflect.ValueOf(a.value)
+	// if a.value is an array, check each element against a.defaultValues
+	if p.Kind() == reflect.Slice {
+		for i := 0; i < pv.Len(); i++ {
+			v := pv.Index(i).Interface()
+			if !validateElement(v, a.defaultValue) {
+				return BadArgument{a, fmt.Sprintf("illegal value %v, must be %v", v, a.defaultValue)}
+			}
+		}
+		return nil
+	} else {
+		// if a.value is not an array, test it against a.defaultValue
+		if !validateElement(a.value, a.defaultValue) {
+			return BadArgument{a, fmt.Sprintf("illegal value %v, must be %v", a.value, a.defaultValue)}
+		}
+	}
+	return nil
+}
+
+// validates a single argument against a (possible) array
+func validateElement(val interface{}, vals interface{}) bool {
+	p := reflect.TypeOf(vals)
+	pv := reflect.ValueOf(vals)
+	// if vals is an array, val must be in it
+	if p.Kind() == reflect.Slice {
+		for i := 0; i < pv.Len(); i++ {
+			v := pv.Index(i).Interface()
+			if val == v {
+				return true
+			}
+		}
+		return false
+	} else {
+		// Both val and vals are not arrays
+		return reflect.TypeOf(val) == reflect.TypeOf(vals)
+	}
+}
+
+/*---------------------*/
+
+// CommandConfig type holds the structure and values of the command-line arguments of command.
+type CommandConfig struct {
+
+	// name of the sub-command ("" for the root command)
+	Name string
+
+	// command-line flags
+	Flags map[string]*Flag
+
+	// mapping of the short flag names with long flag names
+	flagsShort map[string]string
+
+	// registered command argument values
+	Args map[string]*Arg
+
+	// list of the argument names (for ordered iteration)
+	ArgNames []string
+}
+
+// AddArg registers an argument configuration with the command.
+//
+//   - The `name` argument represents the name of the argument.
+//   - If value of the `name` argument ends with `...` suffix, then it is a
+//     variadic argument.
+//   - If the argument is already registered, second return value will be `true`.
+//   - Variadic argument can accept multiple argument values and it should be the
+//     last registered argument.
+//   - Values of a variadic argument will be returned as an array.
+//   - All arguments without a default value must be registered first.
+//   - If an argument with given `name` is already registered, then argument
+//     registration is skipped and registered `*Arg` object returned.
+//   - The `defaultValue` argument represents the default value of the argument,
+//     and determines the type of the argument value.
+//
+// Supported types are:
+//
+//   - int
+//   - string
+//   - float64
+//   - bool
+//   - time.Time
+//   - time.Duration
+//
+// If the provided defaultValue is an array of one of the above types, then that
+// array defines a set of legal values; any provided parameter that doesn't
+// match a value in the array will result in a parse error.
+func (commandConfig *CommandConfig) AddArg(name string, defaultValue interface{}) *Arg {
+
+	// clean argument values
+	name = removeWhitespaces(name)
+
+	// return if argument is already registered
+	if _arg, ok := commandConfig.Args[name]; ok {
+		return _arg
+	}
+
+	rv := Arg{Name: name}
+
+	if v, ok := defaultValue.(string); ok {
+		rv.defaultValue = trimWhitespaces(v)
+	} else {
+		rv.defaultValue = defaultValue
+	}
+
+	// check if argument is variadic
+	if ok, argName := isVariadicArgument(name); ok {
+		rv.Name = argName // change argument name
+		rv.isVariadic = true
+	}
+
+	// register argument with the command-config
+	commandConfig.Args[rv.Name] = &rv
+
+	// store argument name (for ordered iteration)
+	commandConfig.ArgNames = append(commandConfig.ArgNames, rv.Name)
+
+	return &rv
+}
+
+// AddFlag method registers a command-line flag with the command.
+//
+// The rules for flags are the same as for args, but in addition:
+//
+//   - The `name` argument is the long-name of the flag and it should not start
+//     with `--` prefix.
+//   - The `shortName` argument is the short-name of the flag and it should not
+//     start with `-` prefix.
+//   - A boolean flag doesn't accept an input value such as `--flag=<value>` and
+//     its default value is "true".
+//   - If the `name` value starts with `no-` prefix, then it is considered as an
+//     inverted flag.
+//   - Regardless of the default, boolean flags are true if provided, and false if
+//     inverted
+//   - Registering a non-boolean inverted flag will produce an error
+//   - Boolean flag defaults are preserved, but have no effect on the `AsBool()` result.
+func (commandConfig *CommandConfig) AddFlag(name string, shortName string, defaultValue interface{}) (*Flag, error) {
+	// clean argument values
+	name = removeWhitespaces(name)
+
+	isInverted := strings.HasPrefix(name, "no-")
+
+	if isInverted {
+		name = name[3:]
+	}
+	if _, ok := defaultValue.(bool); !ok && isInverted {
+		return nil, fmt.Errorf("non-boolean arguments can not be inverted")
+	}
+
+	// return if flag is already registered
+	if _flag, ok := commandConfig.Flags[name]; ok {
+		return _flag, nil
+	}
+
+	rv := Flag{
+		ShortName: removeWhitespaces(shortName),
+	}
+	rv.Name = name
+	rv.defaultValue = defaultValue
+
+	switch v := defaultValue.(type) {
+	case bool:
+		if isInverted {
+			rv.defaultValue = !v
+		} else {
+			rv.defaultValue = v
+		}
+	case string:
+		rv.defaultValue = trimWhitespaces(v)
+	}
+
+	// check if argument is variadic
+	if ok, argName := isVariadicArgument(name); ok {
+		rv.Name = argName // change argument name
+		rv.isVariadic = true
+	}
+
+	// short flag name should be only one character long
+	l := len(rv.ShortName)
+	switch {
+	case l > 1:
+		return nil, fmt.Errorf("short names must be one character")
+	case l == 1:
+		if isInverted {
+			return nil, fmt.Errorf("inverted flags may not have short versions")
+		}
+		rv.ShortName = rv.ShortName[:1]
+		commandConfig.flagsShort[rv.ShortName] = rv.Name
+	}
+
+	// register flag with the command-config
+	commandConfig.Flags[rv.Name] = &rv
+
+	return &rv, nil
+}
+
+// Arg type holds the structured information about an argument.
+type Arg struct {
+	// name of the argument
+	Name string
+
+	isVariadic   bool
+	defaultValue interface{}
+	value        interface{}
+}
+
+func (a Arg) AsInt() int {
+	if v, ok := a.value.(int); ok {
+		return v
+	} else {
+		v, _ = a.defaultValue.(int)
+		return v
+	}
+}
+
+func (a Arg) AsTime() time.Time {
+	if v, ok := a.value.(time.Time); ok {
+		return v
+	} else {
+		v, _ := a.defaultValue.(time.Time)
+		return v
+	}
+}
+
+func (a Arg) AsDuration() time.Duration {
+	if v, ok := a.value.(time.Duration); ok {
+		return v
+	} else {
+		v, _ = a.defaultValue.(time.Duration)
+		return v
+	}
+}
+
+func (a Arg) AsBool() bool {
+	if v, ok := a.value.(bool); ok {
+		return v
+	} else {
+		v, _ = a.defaultValue.(bool)
+		return v
+	}
+}
+
+func (a Arg) AsString() string {
+	if v, ok := a.value.(string); ok {
+		return v
+	} else {
+		v, _ = a.defaultValue.(string)
+		return v
+	}
+}
+
+func (a Arg) AsFloat() float64 {
+	if v, ok := a.value.(float64); ok {
+		return v
+	} else {
+		v, _ = a.defaultValue.(float64)
+		return v
+	}
+}
+
+func (a Arg) AsInts() []int {
+	if v, ok := a.value.([]int); ok {
+		return v
+	} else {
+		v, _ = a.defaultValue.([]int)
+		return v
+	}
+}
+
+func (a Arg) AsTimes() []time.Time {
+	if v, ok := a.value.([]time.Time); ok {
+		return v
+	} else {
+		v, _ = a.defaultValue.([]time.Time)
+		return v
+	}
+}
+
+func (a Arg) AsDurations() []time.Duration {
+	if v, ok := a.value.([]time.Duration); ok {
+		return v
+	} else {
+		v, _ = a.defaultValue.([]time.Duration)
+		return v
+	}
+}
+
+func (a Arg) AsBools() []bool {
+	if v, ok := a.value.([]bool); ok {
+		return v
+	} else {
+		v, _ = a.defaultValue.([]bool)
+		return v
+	}
+}
+
+func (a Arg) AsStrings() []string {
+	if v, ok := a.value.([]string); ok {
+		return v
+	} else {
+		v, _ = a.defaultValue.([]string)
+		return v
+	}
+}
+
+func (a Arg) AsFloats() []float64 {
+	if v, ok := a.value.([]float64); ok {
+		return v
+	} else {
+		v, _ = a.defaultValue.([]float64)
+		return v
+	}
+}
+
+// Flag type holds the structured information about a flag.
+type Flag struct {
+	Arg
+	// short name of the flag
+	ShortName string
+}
 
 /***********************************************
         PRIVATE FUNCTIONS AND VARIABLES
@@ -67,17 +662,8 @@ func isShortFlag(value string) bool {
 	return isFlag(value) && len(value) == 2 && !strings.HasPrefix(value, "--")
 }
 
-// check if value starts with `--no-` prefix
-func isInvertedFlag(value string) (bool, string) {
-	if isFlag(value) && strings.HasPrefix(value, "--no-") {
-		return true, strings.TrimLeft(value, "--no-") // trim `--no-` prefix
-	}
-
-	return false, ""
-}
-
 // check if flag is unsupported
-func isUnsupportedFlag(value string) bool {
+func isUnknownFlag(value string) bool {
 
 	// a flag should be at least two characters log
 	if len(value) >= 2 {
@@ -155,370 +741,4 @@ func trimWhitespaces(value string) string {
 // remove whitespaces from a value
 func removeWhitespaces(value string) string {
 	return strings.ReplaceAll(value, " ", "")
-}
-
-/***********************************************/
-
-// ErrorUnknownCommand represents an error when command-line arguments contain an unregistered command.
-type ErrorUnknownCommand struct {
-	Name string
-}
-
-func (e ErrorUnknownCommand) Error() string {
-	return fmt.Sprintf("unknown command %s found in the arguments", e.Name)
-}
-
-// ErrorUnknownFlag represents an error when command-line arguments contain an unregistered flag.
-type ErrorUnknownFlag struct {
-	Name string
-}
-
-func (e ErrorUnknownFlag) Error() string {
-	return fmt.Sprintf("unknown flag %s found in the arguments", e.Name)
-}
-
-// ErrorUnsupportedFlag represents an error when command-line arguments contain an unsupported flag.
-type ErrorUnsupportedFlag struct {
-	Name string
-}
-
-func (e ErrorUnsupportedFlag) Error() string {
-	return fmt.Sprintf("unsupported flag %s found in the arguments", e.Name)
-}
-
-/*---------------------*/
-
-// Registry holds the configuration of the registered commands.
-type Registry map[string]*CommandConfig
-
-// Register method registers a command.
-// The "name" argument should be a simple string.
-// If "name" is an empty string, it is considered as a root command.
-// If a command is already registered, the registered `*CommandConfig` object is returned.
-// If the command is already registered, second return value will be `true`.
-func (registry Registry) Register(name string) (*CommandConfig, bool) {
-
-	// remove all whitespaces
-	commandName := removeWhitespaces(name)
-
-	// check if command is already registered, if found, return existing entry
-	if _commandConfig, ok := registry[commandName]; ok {
-		return _commandConfig, true
-	}
-
-	// construct new `CommandConfig` object
-	commandConfig := &CommandConfig{
-		Name:       commandName,
-		Flags:      make(map[string]*Flag),
-		flagsShort: make(map[string]string),
-		Args:       make(map[string]*Arg),
-		ArgNames:   make([]string, 0),
-	}
-
-	// add entry to the registry
-	registry[commandName] = commandConfig
-
-	return commandConfig, false
-}
-
-// Parse method parses command-line arguments and returns an appropriate "*CommandConfig" object registered in the registry.
-// If command is not registered, it return `ErrorUnknownCommand` error.
-// If there is an error parsing a flag, it can return an `ErrorUnknownFlag` or `ErrorUnsupportedFlag` error.
-func (registry Registry) Parse(values []string) (*CommandConfig, error) {
-
-	// command name
-	var commandName string
-
-	// command-line argument values to process
-	valuesToProcess := values
-
-	// check if command is a root command
-	if isRootCommand(values, registry) {
-		commandName = "" // root command name
-	} else {
-		commandName, valuesToProcess = nextValue(values)
-	}
-
-	// format command-line argument values
-	valuesToProcess = formatCommandValues(valuesToProcess)
-
-	// check for invalid flag structure
-	for _, val := range valuesToProcess {
-		if isFlag(val) && isUnsupportedFlag(val) {
-			return nil, ErrorUnsupportedFlag{val}
-		}
-	}
-
-	// if command is not registered, return `ErrorUnknownCommand` error
-	if _, ok := registry[commandName]; !ok {
-		return nil, ErrorUnknownCommand{commandName}
-	}
-
-	// get `CommandConfig` object from the registry
-	commandConfig := registry[commandName]
-
-	// process all command-line arguments (except command name)
-	for {
-
-		// get current command-line argument value
-		var value string
-		value, valuesToProcess = nextValue(valuesToProcess)
-
-		// if `value` is empty, break the loop
-		if len(value) == 0 {
-			break
-		}
-
-		// check if `value` is a `flag` or an `argument`
-		if isFlag(value) {
-
-			// trim `-` characters from the `value`
-			name := strings.TrimLeft(value, "-")
-
-			// get flag object stored in the `commandConfig`
-			var flag *Flag
-
-			// check if flag is short or long
-			if isShortFlag(value) {
-				if _, ok := commandConfig.flagsShort[name]; !ok {
-					return nil, ErrorUnknownFlag{value}
-				}
-
-				// get long flag name
-				flagName := commandConfig.flagsShort[name]
-
-				flag = commandConfig.Flags[flagName]
-			} else {
-
-				// check if a flag is an inverted flag
-				if ok, flagName := isInvertedFlag(value); ok {
-					if _, ok := commandConfig.Flags[flagName]; !ok {
-						return nil, ErrorUnknownFlag{value}
-					}
-
-					flag = commandConfig.Flags[flagName]
-				} else {
-
-					// flag should not registered as an inverted flag
-					if _flag, ok := commandConfig.Flags[name]; !ok || _flag.IsInverted {
-						return nil, ErrorUnknownFlag{value}
-					}
-
-					flag = commandConfig.Flags[name]
-				}
-			}
-
-			// set flag value
-			if flag.IsBoolean {
-				if flag.IsInverted {
-					flag.Value = "false" // if flag is an inverted flag, its value will be `false`
-				} else {
-					flag.Value = "true"
-				}
-			} else {
-				if nextValue, nextValuesToProcess := nextValue(valuesToProcess); len(nextValue) != 0 && !isFlag(nextValue) {
-					flag.Value = nextValue
-					valuesToProcess = nextValuesToProcess
-				}
-			}
-		} else {
-
-			// process as argument
-			for index, argName := range commandConfig.ArgNames {
-
-				// get argument object stored in the `commandConfig`
-				arg := commandConfig.Args[argName]
-
-				// assign value if value of the argument is empty
-				if len(arg.Value) == 0 {
-					arg.Value = value
-					break
-				}
-
-				// if last argument is a variadic argument, append values
-				if (index == len(commandConfig.ArgNames)-1) && arg.IsVariadic {
-					arg.Value += fmt.Sprintf(",%s", value)
-				}
-			}
-		}
-	}
-
-	return commandConfig, nil
-}
-
-// NewRegistry returns new instance of the "Registry"
-func NewRegistry() Registry {
-	return make(Registry)
-}
-
-/*---------------------*/
-
-// CommandConfig type holds the structure and values of the command-line arguments of command.
-type CommandConfig struct {
-
-	// name of the sub-command ("" for the root command)
-	Name string
-
-	// command-line flags
-	Flags map[string]*Flag
-
-	// mapping of the short flag names with long flag names
-	flagsShort map[string]string
-
-	// registered command argument values
-	Args map[string]*Arg
-
-	// list of the argument names (for ordered iteration)
-	ArgNames []string
-}
-
-// AddArg registers an argument configuration with the command.
-// The `name` argument represents the name of the argument.
-// If value of the `name` argument ends with `...` suffix, then it is a variadic argument.
-// Variadic argument can accept multiple argument values and it should be the last registered argument.
-// Values of a variadic argument will be concatenated using comma (,).
-// The `defaultValue` argument represents the default value of the argument.
-// All arguments without a default value must be registered first.
-// If an argument with given `name` is already registered, then argument registration is skipped
-// and registered `*Arg` object returned.
-// If the argument is already registered, second return value will be `true`.
-func (commandConfig *CommandConfig) AddArg(name string, defaultValue string) (*Arg, bool) {
-
-	// clean argument values
-	_name := removeWhitespaces(name)
-	_defaultValue := trimWhitespaces(defaultValue)
-
-	// check if argument is variadic
-	_isVariadic := false
-	if ok, argName := isVariadicArgument(_name); ok {
-		_name = argName // change argument name
-		_isVariadic = true
-	}
-
-	// return if argument is already registered
-	if _arg, ok := commandConfig.Args[_name]; ok {
-		return _arg, true
-	}
-
-	// create `Arg` object
-	arg := &Arg{
-		Name:         _name,
-		DefaultValue: _defaultValue,
-		IsVariadic:   _isVariadic,
-	}
-
-	// register argument with the command-config
-	commandConfig.Args[_name] = arg
-
-	// store argument name (for ordered iteration)
-	commandConfig.ArgNames = append(commandConfig.ArgNames, _name)
-
-	return arg, false
-}
-
-// AddFlag method registers a command-line flag with the command.
-// The `name` argument is the long-name of the flag and it should not start with `--` prefix.
-// The `shortName` argument is the short-name of the flag and it should not start with `-` prefix.
-// The `isBool` argument indicates whether the flag holds a boolean value.
-// A boolean flag doesn't accept an input value such as `--flag=<value>` and its default value is "true".
-// The `defaultValue` argument represents the default value of the flag.
-// In case of a boolean flag, the `defaultValue` is redundant.
-// If the `name` value starts with `no-` prefix, then it is considered as an inverted flag.
-// An inverted flag is registered with the name `<flag>` produced by removing `no-` prefix from `no-<flag>` and its defaut value is "true".
-// When command-line arguments contain `--no-<flag>`, the value of the `<flag>` becomes "false".
-// If a flag with given `name` is already registered, then flag registration is skipped and registered `*Flag` object returned.
-// If the flag is already registered, second return value will be `true`.
-func (commandConfig *CommandConfig) AddFlag(name string, shortName string, isBool bool, defaultValue string) (*Flag, bool) {
-
-	// clean argument values
-	_name := removeWhitespaces(name)
-	_shortName := removeWhitespaces(shortName)
-	_defaultValue := trimWhitespaces(defaultValue)
-
-	// inverted flag is a boolean flag with `no-` prefix
-	_isInvert := false
-
-	// short flag name should be only one character long
-	if _shortName != "" {
-		_shortName = _shortName[:1]
-	}
-
-	// set up `Flag` field values
-	if isBool {
-
-		// check for an inverted flag
-		if strings.HasPrefix(name, "no-") {
-			_isInvert = true                      // is an inverted flag
-			_name = strings.TrimLeft(name, "no-") // trim `no-` prefix
-			_defaultValue = "true"                // default value of an inverted flag is `true`
-			_shortName = ""                       // no short flag name for an inverted flag
-		} else {
-			_defaultValue = "false" // default value of a boolean flag is `true`
-		}
-	}
-
-	// return if flag is already registered
-	if _flag, ok := commandConfig.Flags[_name]; ok {
-		return _flag, true
-	}
-
-	// create a `Flag` object
-	flag := &Flag{
-		Name:         _name,
-		ShortName:    _shortName,
-		IsBoolean:    isBool,
-		IsInverted:   _isInvert,
-		DefaultValue: _defaultValue,
-	}
-
-	// register flag with the command-config
-	commandConfig.Flags[_name] = flag
-
-	// register short flag name (for mapping)
-	if len(_shortName) > 0 {
-		commandConfig.flagsShort[_shortName] = _name
-	}
-
-	return flag, false
-}
-
-/*---------------------*/
-
-// Flag type holds the structured information about a flag.
-type Flag struct {
-
-	// long name of the flag
-	Name string
-
-	// short name of the flag
-	ShortName string
-
-	// if the flag holds boolean value
-	IsBoolean bool
-
-	// if the flag is an inverted flag (with `--no-` prefix)
-	IsInverted bool
-
-	// default value of the flag
-	DefaultValue string
-
-	// value of the flag (provided by the user)
-	Value string
-}
-
-/*---------------------*/
-
-// Arg type holds the structured information about an argument.
-type Arg struct {
-	// name of the argument
-	Name string
-
-	// variadic argument can take multiple values
-	IsVariadic bool
-
-	// default value of the argument
-	DefaultValue string
-
-	// value of the argument (provided by the user)
-	Value string
 }

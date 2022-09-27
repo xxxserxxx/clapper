@@ -2,8 +2,8 @@ package clapper
 
 import (
 	"fmt"
-	"strings"
 	"testing"
+	"time"
 )
 
 // This entire suite would be far easier with testify
@@ -13,8 +13,7 @@ var tests []struct {
 	arg        string
 	longName   string
 	shortName  string
-	isBool     bool
-	defaultVal string
+	defaultVal interface{}
 }
 
 func setup(t *testing.T, args []string) (*CommandConfig, error) {
@@ -23,22 +22,21 @@ func setup(t *testing.T, args []string) (*CommandConfig, error) {
 		arg        string
 		longName   string
 		shortName  string
-		isBool     bool
-		defaultVal string
+		defaultVal interface{}
 	}{
-		{"", "output", "", "", false, ""},
-		{"", "", "force", "f", true, ""},
-		{"", "", "verbose", "v", true, ""},
-		{"", "", "version", "V", false, ""},
-		{"", "", "dir", "", false, "/var/users"},
-		{"info", "category", "", "", false, "manager"},
-		{"info", "username", "", "", false, ""},
-		{"info", "subjects...", "", "", false, ""},
-		{"info", "", "verbose", "v", true, ""},
-		{"info", "", "version", "V", false, "1.0.1"},
-		{"info", "", "output", "o", false, "./"},
-		{"info", "", "no-clean", "", true, ""},
-		{"ghost", "", "", "", false, ""},
+		{"", "output", "", "", ""},
+		{"", "", "force", "f", false},
+		{"", "", "verbose", "v", false},
+		{"", "", "version", "V", ""},
+		{"", "", "dir", "", "/var/users"},
+		{"info", "category", "", "", []string{"manager", "student"}},
+		{"info", "username", "", "", ""},
+		{"info", "subjects...", "", "", ""},
+		{"info", "", "verbose", "v", false},
+		{"info", "", "version", "V", "1.0.1"},
+		{"info", "", "output", "o", "./"},
+		{"info", "", "no-clean", "", true},
+		{"ghost", "", "", "", ""},
 	}
 
 	reg := NewRegistry()
@@ -50,7 +48,7 @@ func setup(t *testing.T, args []string) (*CommandConfig, error) {
 			subs[test.subCommand] = sub
 		}
 		if test.longName != "" {
-			sub.AddFlag(test.longName, test.shortName, test.isBool, test.defaultVal)
+			sub.AddFlag(test.longName, test.shortName, test.defaultVal)
 		} else if test.arg != "" {
 			sub.AddArg(test.arg, test.defaultVal)
 		}
@@ -70,17 +68,17 @@ func TestUnsupportedAssignment(t *testing.T) {
 		options  string
 		err      error
 	}{
-		{"---version", "---version", "---version", ErrorUnsupportedFlag{}},
-		{"---v", "---v", "---v=1.0.0", ErrorUnsupportedFlag{}},
+		{"---version", "---version", "---version", UnknownFlag{}},
+		{"---v", "---v", "---v=1.0.0", UnknownFlag{}},
 		// Single-dash for long names was never supported, but now this is interpreted as:
 		// -v -e -r -s -i -o -n; ergo, the error will be "unknown option '-e'"
-		{"-e", "-version", "-version", ErrorUnsupportedFlag{}},
+		{"-e", "-version", "-version", UnknownFlag{}},
 	}
 
 	for _, test := range tests {
 		reg := NewRegistry()
 		root, _ := reg.Register("")
-		root.AddFlag("version", "v", true, "")
+		root.AddFlag("version", "v", "")
 
 		_, err := reg.Parse([]string{test.options})
 		assertError(t, err, "(%s) %T", test.options, test.err)
@@ -88,9 +86,7 @@ func TestUnsupportedAssignment(t *testing.T) {
 			assertEqual(t, fmt.Sprintf("%T", err), fmt.Sprintf("%T", test.err))
 			var name string
 			switch e := err.(type) {
-			case ErrorUnknownFlag:
-				name = e.Name
-			case ErrorUnsupportedFlag:
+			case UnknownFlag:
 				name = e.Name
 			default:
 				assertError(t, err)
@@ -120,25 +116,18 @@ func TestRootDefaults(t *testing.T) {
 	cmd, err := setup(t, []string{})
 
 	assertNoError(t, err)
-	assertEqual(t, "", cmd.Args["output"].Value)
+	assertEqual(t, "", cmd.Args["output"].defaultValue)
 
 	for _, test := range tests {
 		if test.longName != "" && test.subCommand == "" {
 			f := cmd.Flags[test.longName]
 			assertNotNil(t, f, "missing flag %q", test.longName)
 			assertEqual(t, test.shortName, f.ShortName, "(%s)", test.longName)
-			assertEqual(t, test.isBool, f.IsBoolean, "(%s)", test.longName)
 			dv := test.defaultVal
-			if test.isBool && dv == "" {
-				dv = "false"
-			}
-			assertEqual(t, dv, f.DefaultValue, "(%+v %+v)", test, f)
+			assertEqual(t, dv, f.defaultValue, "(%+v %+v)", test, f)
 		}
 	}
 }
-
-// test root command when not registered
-// REMOVED This was testing code in the demo program, which had nothing to do with the library.
 
 // test an unregistered flag
 func TestUnregisteredFlag(t *testing.T) {
@@ -152,8 +141,8 @@ func TestUnregisteredFlag(t *testing.T) {
 	for flag, options := range flags {
 		_, err := setup(t, options)
 		assertError(t, err)
-		if e, ok := err.(ErrorUnknownFlag); !ok {
-			t.Errorf("expected an ErrUnknownFlag; got %t", err)
+		if e, ok := err.(UnknownFlag); !ok {
+			t.Errorf("expected an UnknownFlag; got %T: %v", err, err)
 		} else {
 			assertEqual(t, flag, e.Name)
 		}
@@ -164,50 +153,24 @@ func TestUnregisteredFlag(t *testing.T) {
 func TestValidInvertFlagValues(t *testing.T) {
 	// options list
 	optionsList := [][]string{
-		{"info", "student", "-V", "-v", "--output", "./opt/dir", "--no-clean"},
-		{"info", "student", "--version", "--no-clean", "--output", "./opt/dir", "--verbose"},
+		{"info", "student", "-v", "--output", "./opt/dir", "--no-clean"},
+		{"info", "student", "--no-clean", "--output", "./opt/dir", "--verbose"},
 	}
-	expecteds := map[string]string{
-		"version": "",
-		"clean":   "false",
+	expecteds := map[string]interface{}{
+		"clean":   false,
 		"output":  "./opt/dir",
-		"verbose": "true",
+		"verbose": true,
 	}
 
 	for _, options := range optionsList {
 		cmd, err := setup(t, options)
 		assertNoError(t, err)
 		assertEqual(t, options[0], cmd.Name)
-		assertEqual(t, options[1], cmd.Args["category"].Value)
-		assertEqual(t, "", cmd.Args["username"].Value)
-		assertEqual(t, "", cmd.Args["subjects"].Value)
-		for _, opt := range options {
-			if strings.HasPrefix("--no", opt) && cmd.Flags[opt].IsInverted != true {
-				t.Errorf("expected inverted flag for %s", opt)
-			}
-		}
+		assertEqual(t, options[1], cmd.Args["category"].value, " (category)")
+		assertEqual(t, nil, cmd.Args["username"].value, " (username)")
+		assertEqual(t, nil, cmd.Args["subjects"].value, " (subjects)")
 		for k, v := range expecteds {
-			assertEqual(t, v, cmd.Flags[k].Value)
-		}
-	}
-}
-
-// test for invalid flag error when an inverted flag is used without `--no-` prefix
-func TestErrorUnknownFlagForInvertFlags(t *testing.T) {
-
-	// options list
-	optionsList := map[string][]string{
-		"--clean":   {"info", "student", "-V", "-v", "--output", "./opt/dir", "--clean"},
-		"--no-dump": {"info", "student", "--version", "--no-dump", "--output", "./opt/dir", "--verbose"},
-	}
-
-	for flag, options := range optionsList {
-		_, err := setup(t, options)
-		assertError(t, err)
-		if e, ok := err.(ErrorUnknownFlag); !ok {
-			t.Errorf("expected an ErrUnknownFlag; got %t", err)
-		} else {
-			assertEqual(t, flag, e.Name)
+			assertEqual(t, v, cmd.Flags[k].value, " (%s) %+v", k, cmd.Flags[k])
 		}
 	}
 }
@@ -223,13 +186,13 @@ func TestFlagAssignmentSyntax(t *testing.T) {
 	for _, options := range optionsList {
 		cmd, err := setup(t, options)
 		assertNoError(t, err)
-		assertEqual(t, options[0], cmd.Name)
-		assertEqual(t, options[1], cmd.Args["category"].Value)
-		assertEqual(t, "thatisuday", cmd.Args["username"].Value)
-		assertEqual(t, "", cmd.Args["subjects"].Value)
-		assertEqual(t, "2.0.0", cmd.Flags["version"].Value)
-		assertEqual(t, "", cmd.Flags["output"].Value)
-		assertEqual(t, "true", cmd.Flags["verbose"].Value)
+		assertEqual(t, "info", cmd.Name)
+		assertEqual(t, "student", cmd.Args["category"].value)
+		assertEqual(t, "thatisuday", cmd.Args["username"].value)
+		assertEqual(t, nil, cmd.Args["subjects"].value)
+		assertEqual(t, "2.0.0", cmd.Flags["version"].value)
+		assertEqual(t, nil, cmd.Flags["output"].value)
+		assertEqual(t, true, cmd.Flags["verbose"].value)
 	}
 }
 
@@ -238,22 +201,20 @@ func TestValidVariadicArgumentValues(t *testing.T) {
 
 	// options list
 	optionsList := [][]string{
-		{"info", "student", "thatisuday", "-V", "-v", "--output", "./opt/dir", "--no-clean", "math", "science", "physics"},
-		{"info", "student", "--version", "--no-clean", "thatisuday", "--output", "./opt/dir", "math", "science", "--verbose", "physics"},
+		{"info", "student", "thatisuday", "-v", "--output", "./opt/dir", "--no-clean", "math", "science", "physics"},
+		{"info", "student", "--no-clean", "thatisuday", "--output", "./opt/dir", "math", "science", "--verbose", "physics"},
 	}
 
 	for _, options := range optionsList {
 		cmd, err := setup(t, options)
 		assertNoError(t, err)
-		assertEqual(t, options[0], cmd.Name)
-		assertEqual(t, options[1], cmd.Args["category"].Value)
-		assertEqual(t, "thatisuday", cmd.Args["username"].Value)
-		assertEqual(t, "math,science,physics", cmd.Args["subjects"].Value)
-		assertEqual(t, "", cmd.Flags["version"].Value)
-		assertEqual(t, "./opt/dir", cmd.Flags["output"].Value)
-		assertEqual(t, "true", cmd.Flags["verbose"].Value)
-		assertEqual(t, "false", cmd.Flags["clean"].Value)
-		assertEqual(t, true, cmd.Flags["clean"].IsInverted)
+		assertEqual(t, "info", cmd.Name)
+		assertEqual(t, "student", cmd.Args["category"].value)
+		assertEqual(t, "thatisuday", cmd.Args["username"].value)
+		assertEqual(t, []string{"math", "science", "physics"}, cmd.Args["subjects"].value)
+		assertEqual(t, "./opt/dir", cmd.Flags["output"].value)
+		assertEqual(t, true, cmd.Flags["verbose"].value)
+		assertEqual(t, false, cmd.Flags["clean"].value)
 	}
 }
 
@@ -274,12 +235,11 @@ func TestRootCommandWithOptions(t *testing.T) {
 		cmd, err := setup(t, options)
 		assertNoError(t, err)
 		assertEqual(t, "", cmd.Name)
-		assertEqual(t, "userinfo", cmd.Args["output"].Value)
-		assertEqual(t, "true", cmd.Flags["force"].Value)
-		assertEqual(t, false, cmd.Flags["force"].IsInverted)
-		assertEqual(t, "true", cmd.Flags["verbose"].Value)
-		assertEqual(t, "1.0.1", cmd.Flags["version"].Value)
-		assertEqual(t, "./sub/dir", cmd.Flags["dir"].Value)
+		assertEqual(t, "userinfo", cmd.Args["output"].value)
+		assertEqual(t, true, cmd.Flags["force"].value)
+		assertEqual(t, true, cmd.Flags["verbose"].value)
+		assertEqual(t, "1.0.1", cmd.Flags["version"].value)
+		assertEqual(t, "./sub/dir", cmd.Flags["dir"].value)
 	}
 }
 
@@ -287,21 +247,20 @@ func TestRootCommandWithOptions(t *testing.T) {
 func TestSubCommandWithOptions(t *testing.T) {
 	// options list
 	optionsList := [][]string{
-		{"info", "student", "-V", "-v", "--output", "./opt/dir"},
-		{"info", "student", "--version", "--output", "./opt/dir", "--verbose"},
+		{"info", "student", "-v", "--output", "./opt/dir"},
+		{"info", "student", "--output", "./opt/dir", "--verbose"},
 	}
 
 	for _, options := range optionsList {
 		cmd, err := setup(t, options)
 		assertNoError(t, err)
 		assertEqual(t, "info", cmd.Name)
-		assertEqual(t, "student", cmd.Args["category"].Value)
-		assertEqual(t, "", cmd.Args["username"].Value)
-		assertEqual(t, "", cmd.Args["subjects"].Value)
-		assertEqual(t, "", cmd.Flags["version"].Value)
-		assertEqual(t, "./opt/dir", cmd.Flags["output"].Value)
-		assertEqual(t, "true", cmd.Flags["verbose"].Value)
-		assertEqual(t, "", cmd.Flags["clean"].Value)
+		assertEqual(t, "student", cmd.Args["category"].value)
+		assertEqual(t, nil, cmd.Args["username"].value)
+		assertEqual(t, nil, cmd.Args["subjects"].value)
+		assertEqual(t, "./opt/dir", cmd.Flags["output"].value)
+		assertEqual(t, true, cmd.Flags["verbose"].value)
+		assertEqual(t, nil, cmd.Flags["clean"].value)
 	}
 }
 
@@ -317,11 +276,65 @@ func TestSubCommandWithArguments(t *testing.T) {
 		cmd, err := setup(t, options)
 		assertNoError(t, err)
 		assertEqual(t, "info", cmd.Name)
-		assertEqual(t, "student", cmd.Args["category"].Value)
-		assertEqual(t, "thatisuday", cmd.Args["username"].Value)
-		assertEqual(t, "", cmd.Args["subjects"].Value)
-		assertEqual(t, "2.0.0", cmd.Flags["version"].Value)
-		assertEqual(t, "", cmd.Flags["output"].Value)
-		assertEqual(t, "true", cmd.Flags["verbose"].Value)
+		assertEqual(t, "student", cmd.Args["category"].value)
+		assertEqual(t, "thatisuday", cmd.Args["username"].value)
+		assertEqual(t, nil, cmd.Args["subjects"].value)
+		assertEqual(t, "2.0.0", cmd.Flags["version"].value)
+		assertEqual(t, nil, cmd.Flags["output"].value)
+		assertEqual(t, true, cmd.Flags["verbose"].value)
+	}
+}
+
+func TestValidate(t *testing.T) {
+	var timeA, timeB time.Time
+	var err error
+	timeA, err = time.Parse("2006-01-02", "1985-08-01")
+	assertNoError(t, err)
+	timeB, err = time.Parse("2006-01-02", "1997-04-10")
+	assertNoError(t, err)
+
+	as := []struct {
+		a Arg
+		e bool
+	}{
+		// single values (type check)
+		{a: Arg{Name: "int", value: 1, defaultValue: 0}, e: false},
+		{a: Arg{Name: "string", value: "a", defaultValue: ""}, e: false},
+		{a: Arg{Name: "bool", value: true, defaultValue: false}, e: false},
+		{a: Arg{Name: "float", value: 1.0, defaultValue: 0.0}, e: false},
+		{a: Arg{Name: "time", value: time.Now(), defaultValue: time.Now()}, e: false},
+		{a: Arg{Name: "duration", value: time.Second, defaultValue: time.Minute}, e: false},
+		// choices
+		{a: Arg{Name: "int choice", value: 1, defaultValue: []int{1, 2, 3}}, e: false},
+		{a: Arg{Name: "string choice", value: "a", defaultValue: []string{"b", "a"}}, e: false},
+		{a: Arg{Name: "float choice", value: 1.0, defaultValue: []float64{0.0, 1.0}}, e: false},
+		{a: Arg{Name: "time choice", value: timeA, defaultValue: []time.Time{timeA, timeB}}, e: false},
+		{a: Arg{Name: "duration choice", value: 2 * time.Second, defaultValue: []time.Duration{2 * time.Second, time.Minute}}, e: false},
+		// Failures
+		{a: Arg{Name: "int choice fail", value: 1, defaultValue: []int{2, 3}}, e: true},
+		{a: Arg{Name: "string choice fail", value: "a", defaultValue: []string{"b"}}, e: true},
+		{a: Arg{Name: "float choice fail", value: 1.0, defaultValue: []float64{2.0}}, e: true},
+		{a: Arg{Name: "time choice fail", value: timeA, defaultValue: []time.Time{timeB}}, e: true},
+		{a: Arg{Name: "duration choice fail", value: time.Second, defaultValue: []time.Duration{time.Minute}}, e: true},
+		// Variadics (type check)
+		{a: Arg{Name: "int variadic", value: []int{1, 2}, defaultValue: 0}, e: false},
+		{a: Arg{Name: "string variadic", value: []string{"a", "b"}, defaultValue: ""}, e: false},
+		{a: Arg{Name: "float variadic", value: []float64{1.0, 2.0}, defaultValue: 0.0}, e: false},
+		{a: Arg{Name: "time variadic", value: []time.Time{timeA, timeB}, defaultValue: time.Now()}, e: false},
+		{a: Arg{Name: "duration variadic", value: []time.Duration{time.Second, 2 * time.Second}, defaultValue: time.Minute}, e: false},
+		// Variadic choices
+		{a: Arg{Name: "int variadic choice", value: []int{1, 2}, defaultValue: []int{1, 2, 3}}, e: false},
+		{a: Arg{Name: "string variadic choice", value: []string{"a", "b"}, defaultValue: []string{"b", "a", "c"}}, e: false},
+		{a: Arg{Name: "float variadic choice", value: []float64{1.0, 2.0}, defaultValue: []float64{0.0, 1.0, 2.0}}, e: false},
+		{a: Arg{Name: "time variadic choice", value: []time.Time{timeA, timeB}, defaultValue: []time.Time{timeA, timeB, time.Now()}}, e: false},
+		{a: Arg{Name: "duration variadic choice", value: []time.Duration{time.Second, 2 * time.Second}, defaultValue: []time.Duration{2 * time.Second, time.Minute, time.Second}}, e: false},
+	}
+	for _, a := range as {
+		err := validateParams(&a.a)
+		if a.e {
+			assertError(t, err)
+		} else {
+			assertNoError(t, err)
+		}
 	}
 }
